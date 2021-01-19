@@ -48,12 +48,7 @@ GET /packages
 Then you can update specific packages like so:
 
 ```
-PUT /packages
-
-[
-  "linux-image",
-  "git"
-]
+PUT /packages?names=git,linux-image
 ```
 
 Or you can update all of the packages:
@@ -77,9 +72,9 @@ GET /packages/status
 
 ## Todo
 
-- [ ] apt-get update
+- [x] apt-get update
 - [ ] auto update functionality
-- [ ] list packages
-- [ ] update specified packages
-- [ ] update all packages
+- [x] list packages
+- [x] update specified packages
+- [x] update all packages
 - [ ] websocket channel
