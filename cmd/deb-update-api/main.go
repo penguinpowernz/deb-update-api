@@ -3,6 +3,7 @@ package main
 import (
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/ghodss/yaml"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -19,6 +21,12 @@ var (
 	aptLastCheck time.Time
 	updLastCheck time.Time
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
 func main() {
 	data, err := ioutil.ReadFile("")
@@ -33,22 +41,38 @@ func main() {
 
 	api := gin.Default()
 
-	s := server{cfg}
-	s.AttachRoutes(api)
+	svr := server{cfg: cfg, statusEvents: make(chan event, len(cfg.Packages))}
+	svr.AttachRoutes(api)
 
 	go updateAptCache(func() {
-		s.checkForUpdateablePackages()
+		svr.checkForUpdateablePackages()
 		if err := autoUpdatePackages(cfg.AutoUpdateables()...); err != nil {
 			log.Println("ERROR: failed to auto update packages:", err)
 		}
+
+		for _, pkg := range cfg.Updateable() {
+			svr.sendStatusEvent(pkg.Name, "update_available", pkg.Version)
+		}
 	})
 
-	s.checkForUpdateablePackages()
+	svr.checkForUpdateablePackages()
 	api.Run(":8020")
 }
 
+type jsonWriter interface {
+	WriteJSON(interface{}) error
+}
+
 type server struct {
-	cfg config
+	cfg          config
+	wsconns      []jsonWriter
+	statusEvents chan event
+}
+
+type event struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Version string `json:"version,omitempty"`
 }
 
 type aptpkg struct {
@@ -73,6 +97,16 @@ func (cfg config) HasPackage(name string) bool {
 	return false
 }
 
+func (cfg config) Updateable() []aptpkg {
+	pkgs := []aptpkg{}
+	for _, pkg := range cfg.Packages {
+		if pkg.UpdateAvailable {
+			pkgs = append(pkgs, pkg)
+		}
+	}
+	return pkgs
+}
+
 func (cfg config) AutoUpdateables() (names []string) {
 	for _, pkg := range cfg.Packages {
 		if pkg.Auto {
@@ -82,10 +116,48 @@ func (cfg config) AutoUpdateables() (names []string) {
 	return
 }
 
+func (svr server) sendStatusEvent(name, status, version string) {
+	if len(svr.statusEvents) == cap(svr.statusEvents) {
+		return
+	}
+	if len(svr.wsconns) == 0 {
+		return
+	}
+	svr.statusEvents <- event{name, status, version}
+}
+
 func (svr server) AttachRoutes(r gin.IRouter) {
+	r.GET("/packages/status", svr.statusUpdates)
 	r.GET("/packages", svr.list)
 	r.PUT("/packages", svr.install)
 	r.PUT("/packages/all", svr.installAll)
+}
+
+func (svr server) updateStatuses(c *gin.Context) {
+	for {
+		ev := <-svr.statusEvents
+		if len(svr.wsconns) == 0 {
+			time.Sleep(time.Second)
+		}
+
+		for _, conn := range svr.wsconns {
+			if err := conn.WriteJSON(ev); err != nil {
+				log.Println("error write json: ", err)
+			}
+		}
+	}
+}
+
+func (svr server) statusUpdates(c *gin.Context) {
+	// Upgrade get request to webSocket protocol
+	ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Println("error get connection")
+		log.Fatal(err)
+	}
+	// defer ws.Close()
+	svr.wsconns = append(svr.wsconns, ws)
+
 }
 
 func (svr server) installAll(c *gin.Context) {
@@ -114,9 +186,21 @@ func (svr server) install(c *gin.Context) {
 		}
 	}
 
+	for _, name := range names {
+		svr.sendStatusEvent(name, "updating", "")
+	}
+
 	if err := installPackage(names...); err != nil {
+		for _, name := range names {
+			svr.sendStatusEvent(name, "update_failed", "")
+		}
 		c.AbortWithError(500, err)
 		return
+	}
+
+	for _, name := range names {
+		ver, _, _ := packageHasUpdate(name)
+		svr.sendStatusEvent(name, "updated", ver)
 	}
 
 	c.Status(200)
