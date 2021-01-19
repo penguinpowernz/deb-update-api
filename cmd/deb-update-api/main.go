@@ -36,7 +36,12 @@ func main() {
 	s := server{cfg}
 	s.AttachRoutes(api)
 
-	go updateAptCache(s.checkForUpdateablePackages)
+	go updateAptCache(func() {
+		s.checkForUpdateablePackages()
+		if err := autoUpdatePackages(cfg.AutoUpdateables()...); err != nil {
+			log.Println("ERROR: failed to auto update packages:", err)
+		}
+	})
 
 	s.checkForUpdateablePackages()
 	api.Run(":8020")
@@ -66,6 +71,15 @@ func (cfg config) HasPackage(name string) bool {
 		}
 	}
 	return false
+}
+
+func (cfg config) AutoUpdateables() (names []string) {
+	for _, pkg := range cfg.Packages {
+		if pkg.Auto {
+			names = append(names, pkg.Name)
+		}
+	}
+	return
 }
 
 func (svr server) AttachRoutes(r gin.IRouter) {
@@ -203,6 +217,10 @@ func updateAptCache(after func()) {
 
 		after()
 	}
+}
+
+func autoUpdatePackages(names ...string) error {
+	return installPackage(names...)
 }
 
 func installPackage(names ...string) error {
