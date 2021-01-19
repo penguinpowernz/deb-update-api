@@ -73,7 +73,7 @@ GET /packages/status
 ## Todo
 
 - [x] apt-get update
-- [ ] auto update functionality
+- [x] auto update functionality
 - [x] list packages
 - [x] update specified packages
 - [x] update all packages
