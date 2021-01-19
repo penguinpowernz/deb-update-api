@@ -62,10 +62,9 @@ You can listen via websockets for package update statuses:
 ```
 GET /packages/status
 
-{"name": "linux-image", "status": "update_queued"}
+{"name": "linux-image", "status": "update_available", "version": "1.2.3"}
 {"name": "linux-image", "status": "updating"}
 {"name": "linux-image", "status": "update_failed"}
-{"name": "linux-image", "status": "update_queued"}
 {"name": "linux-image", "status": "updating"}
 {"name": "linux-image", "status": "updated", "version": "1.2.3"}
 ```
@@ -77,4 +76,6 @@ GET /packages/status
 - [x] list packages
 - [x] update specified packages
 - [x] update all packages
-- [ ] websocket channel
+- [x] websocket channel
+- [ ] test everything
+- [ ] add websocket usage docs to README
