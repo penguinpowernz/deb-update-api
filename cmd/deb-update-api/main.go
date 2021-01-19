@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"io/ioutil"
 	"log"
 	"os"
@@ -11,10 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"github.com/gin-gonic/gin"
 )
-
-var ErrBlacklistedPackage = errors.New("blacklisted package")
 
 var (
 	aptRunning   bool
@@ -23,28 +21,24 @@ var (
 )
 
 func main() {
+	data, err := ioutil.ReadFile("")
+	if err != nil {
+		panic(err)
+	}
+
+	cfg := config{}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		panic(err)
+	}
 
 	api := gin.Default()
 
-	s := server{}
+	s := server{cfg}
 	s.AttachRoutes(api)
 
-	go func() {
-		for {
-			if isAptRunning() {
-				time.Sleep(5 * time.Second)
-				continue
-			}
+	go updateAptCache(s.checkForUpdateablePackages)
 
-			time.Sleep(5 * time.Minute)
-			cmd := exec.Command("/usr/bin/apt-get", "update")
-			cmd.Stdout = os.Stdout
-			if err := cmd.Run(); err == nil {
-				log.Printf("ERROR: %s", err)
-			}
-		}
-	}()
-
+	s.checkForUpdateablePackages()
 	api.Run(":8020")
 }
 
@@ -52,93 +46,105 @@ type server struct {
 	cfg config
 }
 
+type aptpkg struct {
+	Name             string `json:"name"`
+	NiceName         string `json:"name2"`
+	Auto             bool   `json:"auto"`
+	Version          string `json:"version"`
+	UpdateAvailable  bool   `json:"update_available"`
+	AvailableVersion string `json:"available_version"`
+}
+
 type config struct {
-	SearchList       []string
-	BlackList        []string
-	CanInstall       bool
-	NicePackageNames map[string]string
+	Packages []aptpkg
+}
+
+func (cfg config) HasPackage(name string) bool {
+	for _, pkg := range cfg.Packages {
+		if pkg.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (svr server) AttachRoutes(r gin.IRouter) {
-	r.POST("/install", svr.install)
-	r.GET("/list", svr.listUpdates)
+	r.GET("/packages", svr.list)
+	r.PUT("/packages", svr.install)
+	r.PUT("/packages/all", svr.installAll)
 }
 
-func (svr server) install(c *gin.Context) {
-	if !svr.cfg.CanInstall {
-		c.AbortWithStatus(403)
+func (svr server) installAll(c *gin.Context) {
+	names := []string{}
+	for _, pkg := range svr.cfg.Packages {
+		if pkg.UpdateAvailable {
+			names = append(names, pkg.Name)
+		}
+	}
+
+	if err := installPackage(names...); err != nil {
+		c.AbortWithError(500, err)
 		return
 	}
 
-	pkgs := svr.packagesWithUpdates()
-	for _, pkg := range pkgs {
-		if err := svr.installPackage(pkg[0]); err != nil && err != ErrBlacklistedPackage {
-			c.AbortWithError(500, err)
+	c.Status(204)
+}
+
+func (svr server) install(c *gin.Context) {
+	names := strings.Split(c.Query("names"), ",")
+
+	for _, name := range names {
+		if !svr.cfg.HasPackage(name) {
+			c.AbortWithStatus(403)
+			return
 		}
+	}
+
+	if err := installPackage(names...); err != nil {
+		c.AbortWithError(500, err)
+		return
 	}
 
 	c.Status(200)
 }
 
-func (svr server) listUpdates(c *gin.Context) {
-	pkgs := svr.packagesWithUpdates()
-	c.JSON(299, pkgs)
-}
+func (svr server) list(c *gin.Context) {
+	pkgs := []aptpkg{}
+	upkgs := []aptpkg{}
 
-func (svr server) installPackage(name string) error {
-	for _, pkg := range svr.cfg.BlackList {
-		if pkg == name {
-			return ErrBlacklistedPackage
+	for _, pkg := range svr.cfg.Packages {
+		if pkg.UpdateAvailable {
+			upkgs = append(upkgs, pkg)
+		} else {
+			pkgs = append(pkgs, pkg)
 		}
 	}
 
-	var found bool
-	for _, pkg := range svr.cfg.SearchList {
-		if pkg == name {
-			found = true
-		}
-	}
-
-	if !found {
-		return ErrBlacklistedPackage
-	}
-
-	cmd := exec.Command("apt-get", "install", "-y", name)
-	cmd.Stdout = os.Stdout
-	return cmd.Run()
+	c.JSON(200, map[string]interface{}{
+		"updateable": upkgs,
+		"current":    pkgs,
+	})
 }
 
-func (svr server) packagesWithUpdates() (pkgs [][]string) {
-	for _, pkg := range svr.cfg.SearchList {
-		v, yes := packageHasUpdate(pkg)
-		if yes {
-			pkgs = append(pkgs, []string{svr.nicePackageName(pkg), v})
-		}
+func (svr *server) checkForUpdateablePackages() {
+	for _, pkg := range svr.cfg.Packages {
+		pkg.Version, pkg.AvailableVersion, pkg.UpdateAvailable = packageHasUpdate(pkg.Name)
 	}
-	return
 }
 
-func (svr server) nicePackageName(n string) string {
-	npn, found := svr.cfg.NicePackageNames[n]
-	if found {
-		return npn
-	}
-	return n
-}
-
-func packageHasUpdate(name string) (string, bool) {
-	cmd := exec.Command("bash", "-c", `apt-cache policy signal-desktop|grep -A 1 "Version table"|grep "***"`)
+func packageHasUpdate(name string) (string, string, bool) {
+	cmd := exec.Command("bash", "-c", `apt-cache policy `+name+` | grep -P "Installed|Candidate" `)
 	data, err := cmd.Output()
 	if err != nil {
-		return "", false
+		log.Println("ERROR: failed to detect package version for", name, ":", err)
+		return "", "", false
 	}
 
-	bits := strings.Split(string(data), " ")
-	if len(bits) < 3 {
-		return "", false
-	}
+	lines := strings.Split(string(data), "\n")
+	availVersion := strings.Split(lines[0], ": ")[1]
+	version := strings.Split(lines[1], ": ")[1]
 
-	return bits[2], true
+	return version, availVersion, availVersion != version
 }
 
 // Check if package manager is running (every 5 seconds).
@@ -179,4 +185,29 @@ func isAptRunning() bool {
 	}
 
 	return aptRunning
+}
+
+func updateAptCache(after func()) {
+	for {
+		if isAptRunning() {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		time.Sleep(5 * time.Minute)
+		cmd := exec.Command("/usr/bin/apt-get", "update")
+		cmd.Stdout = os.Stdout
+		if err := cmd.Run(); err == nil {
+			log.Printf("ERROR: updating apt cache: %s", err)
+		}
+
+		after()
+	}
+}
+
+func installPackage(names ...string) error {
+	cmd := exec.Command("apt-get", "install", "-y")
+	os.Args = append(os.Args, names...)
+	cmd.Stdout = os.Stdout
+	return cmd.Run()
 }
